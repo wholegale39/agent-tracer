@@ -1,5 +1,8 @@
 # Agent Call Tracer · Agent 调用追踪器
 
+![License](https://img.shields.io/badge/license-MIT-green) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![GitHub stars](https://img.shields.io/github/stars/wholegale39/agent-tracer)
+
+
 记录 Agent 的每一次工具调用——入参、出参、耗时、错误。支持按会话回溯、跨工具过滤、错误汇总，还能对失败的调用生成重放指令。
 
 ## 为什么做这个？
