@@ -7,6 +7,7 @@ BASE = "http://localhost:8770"
 
 def test_full_trace():
     c = httpx.Client(base_url=BASE)
+    terminal_span_id = None
 
     # 1. Create trace
     r = c.post("/traces", json={"agent": "market-bot", "task": "收盘汇总", "session_id": "s1"})
@@ -27,6 +28,8 @@ def test_full_trace():
         r = c.post(f"/traces/{trace_id}/spans", json=s)
         assert r.status_code == 200
         print(f"✅ 2.{i+1} Span added: {s['tool_name']} ({r.json()['span_id']})")
+        if s["tool_name"] == "terminal":
+            terminal_span_id = r.json()["span_id"]
 
     # 3. Finish trace
     r = c.post(f"/traces/{trace_id}/finish")
@@ -49,9 +52,9 @@ def test_full_trace():
     assert errors[0]["tool_name"] == "terminal"
     print(f"✅ 5. Error spans: {len(errors)} found")
 
-    # 6. Replay (the failed terminal call)
-    r = c.post("/spans/4/replay", json={
-        "span_id": 4,
+    # 6. Replay (the failed terminal call — use the real span id, not a hardcoded one)
+    r = c.post(f"/spans/{terminal_span_id}/replay", json={
+        "span_id": terminal_span_id,
         "arguments_override": {"command": "python3 gen_chart.py --timeout 60"},
     })
     replay = r.json()

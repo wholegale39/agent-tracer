@@ -132,6 +132,43 @@ def cmd_check_trace(args):
         print("   identical to golden case")
 
 
+def cmd_export_trace(args):
+    data = api("GET", f"/traces/{args.trace_id}/export")
+    out = args.output or f"trace_{args.trace_id}.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"✅ Trace exported: {out} ({len(data['spans'])} spans)")
+
+
+def cmd_export_case(args):
+    r = httpx.get(f"{BASE}/cases/{args.case_id}/export", timeout=15)
+    r.raise_for_status()
+    out = args.output or f"test_golden_{args.case_id}.py"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(r.text)
+    print(f"✅ Self-contained pytest case exported: {out}")
+    print(f"   Run: TRACE_FILE=<trace.json> pytest {out}")
+
+
+def cmd_drift(args):
+    data = api("GET", f"/agents/{args.agent}/drift-report", params={"limit": args.limit})
+    if not data.get("golden_case"):
+        print(f"⚪ {data.get('message', 'no golden case')}")
+        return
+    gc = data["golden_case"]
+    print(f"Golden case: {gc['name']}  ({gc['span_count']} spans)")
+    print(f"Checked {data['checked_traces']} traces → "
+          f"✅{data['counts'].get('match', 0)} ⚠️{data['counts'].get('drift', 0)} "
+          f"🔴{data['counts'].get('regression', 0)}  (regression rate {data['regression_rate']})")
+    if data.get("first_regression_at"):
+        print(f"First regression at: {data['first_regression_at'][:19]}")
+    print()
+    for r in data["results"]:
+        mark = {"match": "✅", "drift": "⚠️", "regression": "🔴"}.get(r["verdict"], "?")
+        print(f"  {mark} {r['trace_id']}  {r['verdict']:<10} score={r['score']}  "
+              f"diffs={r['diff_count']}  {r['started_at'][:19]}")
+
+
 def main():
     global BASE
     import argparse
@@ -181,6 +218,21 @@ def main():
     p = sub.add_parser("check-trace", help="Check a trace against the golden case for its agent")
     p.add_argument("trace_id")
     p.set_defaults(func=cmd_check_trace)
+
+    p = sub.add_parser("export-trace", help="Export a trace as JSON")
+    p.add_argument("trace_id")
+    p.add_argument("-o", "--output", default="", help="Output file path")
+    p.set_defaults(func=cmd_export_trace)
+
+    p = sub.add_parser("export-case", help="Export a golden case as a self-contained pytest file")
+    p.add_argument("case_id")
+    p.add_argument("-o", "--output", default="", help="Output file path")
+    p.set_defaults(func=cmd_export_case)
+
+    p = sub.add_parser("drift", help="Batch drift report for an agent vs its golden case")
+    p.add_argument("agent")
+    p.add_argument("--limit", type=int, default=20, help="Number of recent traces to check")
+    p.set_defaults(func=cmd_drift)
 
     args = parser.parse_args()
     if not args.command:

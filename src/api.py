@@ -8,9 +8,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 
 from .models import ReplayRequest, Span, SpanIn, Trace, TraceIn
-from .regression import CheckResult, compare, suggest_case_name, trace_signature
+from .regression import (CheckResult, compare, export_pytest_case,
+                         suggest_case_name, trace_signature,
+                         trace_to_export_dict)
 from .store import TraceStore
 
 
@@ -289,6 +292,97 @@ async def check_trace_against_golden(trace_id: str):
         "diffs": [d.__dict__ for d in result.diffs],
         "golden_span_count": len(sig.get("spans", [])),
         "new_span_count": len(trace.spans),
+    }
+
+
+# ── Export & drift report ──────────────────────────────────────
+
+@app.get("/traces/{trace_id}/export")
+async def export_trace(trace_id: str):
+    """Export a trace as plain JSON (offline analysis / feed to pytest case)."""
+    trace = await store.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(404, "Trace not found")
+    return trace_to_export_dict(trace)
+
+
+@app.get("/cases/{case_id}/export")
+async def export_case_pytest(case_id: str):
+    """Export a golden case as a self-contained pytest regression test file."""
+    case = await store.get_case(case_id)
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    import json
+    sig = json.loads(case["signature"])
+    code = export_pytest_case(
+        signature=sig,
+        case_id=case["id"],
+        case_name=case["name"],
+        source_trace_id=case["source_trace_id"],
+    )
+    filename = f"test_golden_{case['id']}.py"
+    return PlainTextResponse(
+        code,
+        media_type="text/x-python",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/agents/{agent}/drift-report")
+async def drift_report(agent: str, limit: int = 20):
+    """Batch-compare an agent's recent traces against its golden case.
+
+    Returns per-trace verdicts plus aggregate stats: how many matched,
+    drifted, regressed, and the first regression time if any.
+    """
+    case = await store.find_case_for_agent(agent)
+    if not case:
+        return {
+            "agent": agent,
+            "golden_case": None,
+            "message": f"No golden case for agent '{agent}' yet — promote a trace first",
+        }
+
+    import json
+    sig = json.loads(case["signature"])
+    traces = await store.list_traces(limit=limit, agent=agent)
+
+    results = []
+    regressions = []
+    for t in traces:
+        trace = await store.get_trace(t["id"])
+        if not trace:
+            continue
+        r = compare(sig, trace)
+        results.append({
+            "trace_id": trace.id,
+            "started_at": trace.started_at,
+            "verdict": r.verdict,
+            "score": r.score,
+            "diff_count": len(r.diffs),
+        })
+        if r.verdict == "regression":
+            regressions.append(trace.started_at)
+
+    total = len(results)
+    counts = {"match": 0, "drift": 0, "regression": 0}
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+
+    return {
+        "agent": agent,
+        "golden_case": {
+            "id": case["id"],
+            "name": case["name"],
+            "source_trace_id": case["source_trace_id"],
+            "span_count": len(sig.get("spans", [])),
+        },
+        "checked_traces": total,
+        "counts": counts,
+        "regression_rate": round(counts["regression"] / total, 2) if total else 0,
+        "first_regression_at": regressions[-1] if regressions else None,
+        "results": results,
     }
 
 
