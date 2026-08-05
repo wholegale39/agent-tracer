@@ -22,6 +22,10 @@ class SpanIn(BaseModel):
     started_at: Optional[str] = None  # ISO timestamp
     finished_at: Optional[str] = None
     duration_ms: Optional[float] = None
+    # Cost tracking (v0.4)
+    model: Optional[str] = None       # model used for this call (e.g. deepseek-v4-flash)
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
 
 
 class Span(SpanIn):

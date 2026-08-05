@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
 from .models import ReplayRequest, Span, SpanIn, Trace, TraceIn
+from . import cost
 from .regression import (CheckResult, compare, export_pytest_case,
                          suggest_case_name, trace_signature,
                          trace_to_export_dict)
@@ -29,7 +30,7 @@ async def lifespan(app: FastAPI):
     await store.close()
 
 
-app = FastAPI(title="Agent Call Tracer", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Agent Call Tracer", version="0.4.0", lifespan=lifespan)
 
 
 # ── Traces ───────────────────────────────────────────────
@@ -84,6 +85,9 @@ async def add_span(trace_id: str, span_in: SpanIn):
         started_at=span_in.started_at or now,
         finished_at=span_in.finished_at,
         duration_ms=span_in.duration_ms,
+        model=span_in.model,
+        input_tokens=span_in.input_tokens,
+        output_tokens=span_in.output_tokens,
     )
     span_id = await store.add_span(trace_id, span)
     return {"span_id": span_id, "trace_id": trace_id}
@@ -384,6 +388,99 @@ async def drift_report(agent: str, limit: int = 20):
         "first_regression_at": regressions[-1] if regressions else None,
         "results": results,
     }
+
+
+# ── Cost & error attribution (v0.4) ────────────────────────────
+
+@app.get("/cost/traces/{trace_id}")
+async def trace_cost_report(trace_id: str):
+    """Cost breakdown for one trace (per tool / per model)."""
+    trace = await store.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(404, "Trace not found")
+    return cost.trace_cost(trace)
+
+
+@app.get("/cost/summary")
+async def cost_summary(agent: str = "", limit: int = 50, days: Optional[float] = None):
+    """Aggregate cost across recent traces.
+
+    Breakdowns: per tool, per model, per agent. Optional agent filter
+    and time window (days) to scope the report.
+    """
+    traces = await store.list_traces(limit=limit, agent=agent)
+    loaded = []
+    for t in traces:
+        trace = await store.get_trace(t["id"])
+        if trace:
+            loaded.append(trace)
+
+    if days is not None:
+        cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+        loaded = [t for t in loaded
+                  if _ts(t.started_at, 0) >= cutoff]
+
+    totals = {"traces": 0, "spans": 0, "input_tokens": 0, "output_tokens": 0,
+              "total_tokens": 0, "input_cost": 0.0, "output_cost": 0.0,
+              "total_cost": 0.0}
+    per_tool: dict[str, dict] = {}
+    per_model: dict[str, dict] = {}
+    per_agent: dict[str, dict] = {}
+
+    for t in loaded:
+        c = cost.trace_cost(t)
+        a = c["totals"]
+        totals["traces"] += 1
+        totals["spans"] += a["spans"]
+        totals["input_tokens"] += a["input_tokens"]
+        totals["output_tokens"] += a["output_tokens"]
+        totals["total_tokens"] += a["total_tokens"]
+        totals["input_cost"] = round(totals["input_cost"] + a["input_cost"], 6)
+        totals["output_cost"] = round(totals["output_cost"] + a["output_cost"], 6)
+        totals["total_cost"] = round(totals["total_cost"] + a["total_cost"], 6)
+
+        for tool, d in c["per_tool"].items():
+            bt = per_tool.setdefault(tool, {"calls": 0, "total_tokens": 0, "total_cost": 0.0})
+            bt["calls"] += d["calls"]
+            bt["total_tokens"] += d["total_tokens"]
+            bt["total_cost"] = round(bt["total_cost"] + d["total_cost"], 6)
+        for model, d in c["per_model"].items():
+            bm = per_model.setdefault(model, {"calls": 0, "total_tokens": 0, "total_cost": 0.0})
+            bm["calls"] += d["calls"]
+            bm["total_tokens"] += d["total_tokens"]
+            bm["total_cost"] = round(bm["total_cost"] + d["total_cost"], 6)
+        ba = per_agent.setdefault(t.agent, {"traces": 0, "total_cost": 0.0, "total_tokens": 0})
+        ba["traces"] += 1
+        ba["total_tokens"] += a["total_tokens"]
+        ba["total_cost"] = round(ba["total_cost"] + a["total_cost"], 6)
+
+    _rank = lambda d: dict(sorted(d.items(), key=lambda kv: kv[1]["total_cost"], reverse=True))
+    return {
+        "scoped_traces": totals["traces"],
+        "totals": totals,
+        "per_tool": _rank(per_tool),
+        "per_model": _rank(per_model),
+        "per_agent": _rank(per_agent),
+        "filters": {"agent": agent, "limit": limit, "days": days},
+    }
+
+
+@app.get("/errors/aggregate")
+async def error_aggregate(limit: int = 500):
+    """Multi-session error attribution.
+
+    Groups error spans across traces by normalized fingerprint, sorted by
+    frequency — surfaces recurring root causes instead of one-off failures.
+    """
+    spans = await store.list_errors(limit=limit)
+    return cost.aggregate_errors(spans)
+
+
+def _ts(iso: Optional[str], default: float) -> float:
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return default
 
 
 # ── Health ──────────────────────────────────────────────

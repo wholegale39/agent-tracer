@@ -50,12 +50,14 @@ class TraceStore:
                 started_at TEXT,
                 finished_at TEXT,
                 duration_ms REAL,
+                model TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
                 FOREIGN KEY (trace_id) REFERENCES traces(id)
             );
             CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(trace_id);
             CREATE INDEX IF NOT EXISTS idx_spans_tool ON spans(tool_name);
             CREATE INDEX IF NOT EXISTS idx_traces_agent ON traces(agent);
-
             CREATE TABLE IF NOT EXISTS cases (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -70,6 +72,14 @@ class TraceStore:
             );
             CREATE INDEX IF NOT EXISTS idx_cases_agent ON cases(agent);
         """)
+        # v0.4 migration: add cost-tracking columns to existing DBs (no-op on fresh)
+        for col in ("model", "input_tokens", "output_tokens"):
+            coltype = "TEXT" if col == "model" else "INTEGER"
+            try:
+                await self._conn.execute(f"ALTER TABLE spans ADD COLUMN {col} {coltype}")
+                logger.info(f"migrated: spans.{col} added")
+            except Exception:
+                pass  # column already exists
         await self._conn.commit()
 
     # ── Traces ────────────────────────────────────────────
@@ -131,11 +141,12 @@ class TraceStore:
 
         await self._conn.execute(
             """INSERT INTO spans (trace_id, sequence, tool_name, arguments, result, error,
-               started_at, finished_at, duration_ms)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               started_at, finished_at, duration_ms, model, input_tokens, output_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (trace_id, seq, span.tool_name, json.dumps(span.arguments),
              span.result, span.error,
-             span.started_at or now, span.finished_at, span.duration_ms)
+             span.started_at or now, span.finished_at, span.duration_ms,
+             span.model, span.input_tokens, span.output_tokens)
         )
         await self._conn.execute(
             "UPDATE traces SET span_count = span_count + 1 WHERE id = ?", (trace_id,)

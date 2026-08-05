@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-MIT-green) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![GitHub stars](https://img.shields.io/github/stars/wholegale39/agent-tracer)
 
-记录 Agent 的每一次工具调用——入参、出参、耗时、错误。支持按会话回溯、跨工具过滤、错误汇总，还能对失败的调用生成重放指令。**升级版自带回归测试闭环：把一次成功运行提升为黄金用例，后续运行自动对比，漂移和回归一眼可见。**
+记录 Agent 的每一次工具调用——入参、出参、耗时、错误。支持按会话回溯、跨工具过滤、错误汇总，还能对失败的调用生成重放指令。**升级版自带回归测试闭环：把一次成功运行提升为黄金用例，后续运行自动对比，漂移和回归一眼可见；v0.4 起支持按 token 归因成本、跨会话错误指纹聚桶。**
 
 ## 为什么做这个？
 
@@ -57,6 +57,10 @@ c.post(f"/traces/{trace_id}/spans", json={
     "arguments": {"url": "https://api.example.com/market"},
     "error": "timeout after 30s",
     "duration_ms": 30500,
+    # v0.4：可选，带上模型与 token 数即可自动算成本
+    "model": "deepseek-v4-flash",
+    "input_tokens": 12500,
+    "output_tokens": 800,
 })
 
 # 结束 trace
@@ -161,6 +165,25 @@ python3 tracer.py drift <agent> [--limit 20]
 
 输出每次运行的判定 + 汇总（✅/⚠️/🔴 计数、regression rate、首次回归时间），适合 cron 定期跑，Agent 行为漂移第一时间暴露。
 
+## 成本分析 & 多会话错误归因（v0.4 新增）
+
+**成本分析** —— span 记录时带上 `model` / `input_tokens` / `output_tokens`（三个都可选），内置 20+ 常见模型定价表（DeepSeek / OpenAI / Anthropic / Gemini / 本地模型 $0），自动按 trace / 工具 / 模型 / agent 归因成本；未知模型按默认估算价，定价表可改 `src/cost.py` 的 `MODEL_PRICING`。
+
+```bash
+# 单次 trace 的成本明细（per tool / per model）
+curl -s http://localhost:8770/cost/traces/<trace_id>
+
+# 汇总报告：?agent=market-bot 过滤，?days=7 只看最近 7 天
+curl -s "http://localhost:8770/cost/summary?days=7"
+```
+
+**多会话错误归因** —— 把跨 trace 的错误按归一化指纹聚桶：数字、超时秒数、十六进制地址、引号内容都会归一成通配符（`timeout after 30s` 和 `timeout after 60s` 归到同一桶），按出现次数排序——一眼看出"哪个错误天天在犯"，而不是被一次性故障淹没。
+
+```bash
+curl -s "http://localhost:8770/errors/aggregate"
+# → buckets: [{fingerprint: "timeout after N calling ...", count: 12, trace_ids: [...]}]
+```
+
 ## API
 
 | Method | Path | 说明 |
@@ -181,6 +204,9 @@ python3 tracer.py drift <agent> [--limit 20]
 | `GET` | `/traces/{id}/export` | 导出 trace 为 JSON (v0.3) |
 | `GET` | `/cases/{id}/export` | 导出黄金用例为 pytest 文件 (v0.3) |
 | `GET` | `/agents/{agent}/drift-report` | 批量漂移趋势报告 (v0.3) |
+| `GET` | `/cost/traces/{id}` | 单次 trace 成本明细（per tool / per model）(v0.4) |
+| `GET` | `/cost/summary` | 成本汇总（per tool / model / agent，`?agent=&days=` 过滤）(v0.4) |
+| `GET` | `/errors/aggregate` | 跨会话错误归因（指纹聚桶）(v0.4) |
 
 ## 数据模型
 
@@ -194,7 +220,9 @@ Trace (一次 Agent 运行)
            ├── arguments: {query: "上证指数"}
            ├── result: "3200点"
            ├── error: null
-           └── duration_ms: 850
+           ├── duration_ms: 850
+           ├── model: "deepseek-v4-flash"     ← v0.4 成本
+           └── input/output_tokens: 12500/800  ← v0.4 成本
 
 Case (黄金回归用例, v0.2)
  ├── name: "market-bot/收盘汇总 · 7c53817c"
@@ -216,7 +244,7 @@ FastAPI (8770)
 ## 测试
 
 ```bash
-# 单元测试（无需起服务）：回归引擎 + 导出功能
+# 单元测试（无需起服务）：回归引擎 + 导出 + 成本/归因
 python3 -m pytest -q
 
 # 端到端（需先起服务）
