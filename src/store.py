@@ -55,6 +55,20 @@ class TraceStore:
             CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(trace_id);
             CREATE INDEX IF NOT EXISTS idx_spans_tool ON spans(tool_name);
             CREATE INDEX IF NOT EXISTS idx_traces_agent ON traces(agent);
+
+            CREATE TABLE IF NOT EXISTS cases (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                agent TEXT NOT NULL DEFAULT '',
+                task TEXT DEFAULT '',
+                source_trace_id TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_check_at TEXT,
+                last_verdict TEXT,
+                last_score REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cases_agent ON cases(agent);
         """)
         await self._conn.commit()
 
@@ -165,3 +179,58 @@ class TraceStore:
             (limit,)
         )
         return [Span.from_db_row(r) for r in rows]
+
+    # ── Cases (golden regression cases) ────────────────────────
+
+    async def create_case(self, case_id: str, name: str, agent: str, task: str,
+                          source_trace_id: str, signature: dict) -> None:
+        import json
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO cases (id, name, agent, task, source_trace_id, signature, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (case_id, name, agent, task, source_trace_id, json.dumps(signature, ensure_ascii=False), now)
+        )
+        await self._conn.commit()
+
+    async def list_cases(self, agent: str = "", limit: int = 50) -> list[dict]:
+        if agent:
+            rows = await self._conn.execute_fetchall(
+                "SELECT * FROM cases WHERE agent = ? ORDER BY created_at DESC LIMIT ?",
+                (agent, limit)
+            )
+        else:
+            rows = await self._conn.execute_fetchall(
+                "SELECT * FROM cases ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+        return [dict(r) for r in rows]
+
+    async def get_case(self, case_id: str) -> Optional[dict]:
+        rows = await self._conn.execute_fetchall(
+            "SELECT * FROM cases WHERE id = ?", (case_id,)
+        )
+        if not rows:
+            return None
+        return dict(rows[0])
+
+    async def find_case_for_agent(self, agent: str, task: str = "") -> Optional[dict]:
+        """Find the most recent golden case for an agent (optionally matching task)."""
+        if task:
+            rows = await self._conn.execute_fetchall(
+                "SELECT * FROM cases WHERE agent = ? AND task = ? ORDER BY created_at DESC LIMIT 1",
+                (agent, task)
+            )
+        else:
+            rows = await self._conn.execute_fetchall(
+                "SELECT * FROM cases WHERE agent = ? ORDER BY created_at DESC LIMIT 1",
+                (agent,)
+            )
+        return dict(rows[0]) if rows else None
+
+    async def update_case_result(self, case_id: str, verdict: str, score: float) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "UPDATE cases SET last_check_at = ?, last_verdict = ?, last_score = ? WHERE id = ?",
+            (now, verdict, score, case_id)
+        )
+        await self._conn.commit()

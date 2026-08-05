@@ -70,7 +70,70 @@ def cmd_replay(args):
     print(f"  {data['replay_instructions']}")
 
 
+def cmd_promote(args):
+    data = api("POST", f"/traces/{args.trace_id}/promote", params={"task": args.task} if args.task else {})
+    print(f"✅ Golden case created: {data['case_id']}")
+    print(f"   {data['name']}")
+    print(f"   source trace: {data['source_trace_id']} ({data['spans']} spans)")
+
+
+def cmd_cases(args):
+    params = f"?agent={args.agent}" if args.agent else ""
+    result = api("GET", f"/cases{params}")
+    if not result:
+        print("No golden cases yet. Promote a trace: tracer.py promote <trace_id>")
+        return
+    for c in result:
+        verdict = c.get("last_verdict", "—")
+        score = c.get("last_score", "—")
+        mark = {"match": "✅", "drift": "⚠️", "regression": "🔴"}.get(verdict, "⚪")
+        print(f"  {mark} {c['id']}  {c['name']}")
+        print(f"     agent={c['agent']}  last={verdict} ({score})  src={c['source_trace_id']}")
+
+
+def cmd_case(args):
+    data = api("GET", f"/cases/{args.case_id}")
+    print(f"Case: {data['name']}  ({data['id']})")
+    print(f"Agent: {data['agent']}  Task: {data['task']}")
+    print(f"Source trace: {data['source_trace_id']}")
+    print(f"Last check: {data.get('last_verdict', '—')} ({data.get('last_score', '—')})")
+    print()
+    sig = data["signature"]
+    print(f"Golden signature: {sig['span_count']} spans")
+    for i, s in enumerate(sig["spans"]):
+        mark = "❌" if s["status"] == "error" else "✓"
+        print(f"  #{i + 1} {s['tool']} {s['arg_keys']} {mark}")
+
+
+def cmd_check(args):
+    data = api("POST", f"/cases/{args.case_id}/check", params={"trace_id": args.trace_id} if args.trace_id else {})
+    mark = {"match": "✅", "drift": "⚠️", "regression": "🔴"}.get(data["verdict"], "?")
+    print(f"{mark} {data['verdict'].upper()}  (score {data['score']})")
+    print(f"   checked trace: {data['checked_trace_id']}  ({data['checked_agent']}/{data['checked_task']})")
+    print(f"   golden {data['golden_span_count']} spans → new {data['new_span_count']} spans")
+    for d in data["diffs"]:
+        print(f"   - [{d['kind']}] {d['message']}")
+    if data["verdict"] == "match":
+        print("   identical to golden case")
+
+
+def cmd_check_trace(args):
+    data = api("POST", f"/traces/{args.trace_id}/check")
+    if not data.get("found"):
+        print(f"⚪ {data['message']}")
+        return
+    mark = {"match": "✅", "drift": "⚠️", "regression": "🔴"}.get(data["verdict"], "?")
+    print(f"{mark} {data['verdict'].upper()}  (score {data['score']})")
+    print(f"   case: {data['case_name']}")
+    print(f"   golden {data['golden_span_count']} spans → new {data['new_span_count']} spans")
+    for d in data["diffs"]:
+        print(f"   - [{d['kind']}] {d['message']}")
+    if data["verdict"] == "match":
+        print("   identical to golden case")
+
+
 def main():
+    global BASE
     import argparse
     parser = argparse.ArgumentParser(description="Agent Call Tracer CLI")
     parser.add_argument("--base", default=BASE, help="API base URL")
@@ -96,6 +159,28 @@ def main():
     p = sub.add_parser("replay", help="Get replay instructions for a span")
     p.add_argument("span_id", type=int)
     p.set_defaults(func=cmd_replay)
+
+    p = sub.add_parser("promote", help="Promote a trace into a golden regression case")
+    p.add_argument("trace_id")
+    p.add_argument("--task", default="", help="Override task name for the case")
+    p.set_defaults(func=cmd_promote)
+
+    p = sub.add_parser("cases", help="List golden regression cases")
+    p.add_argument("--agent", default="", help="Filter by agent")
+    p.set_defaults(func=cmd_cases)
+
+    p = sub.add_parser("case", help="Show a regression case's golden signature")
+    p.add_argument("case_id")
+    p.set_defaults(func=cmd_case)
+
+    p = sub.add_parser("check", help="Check a case against a trace (or its agent's latest)")
+    p.add_argument("case_id")
+    p.add_argument("--trace", dest="trace_id", default="", help="Specific trace ID to check")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("check-trace", help="Check a trace against the golden case for its agent")
+    p.add_argument("trace_id")
+    p.set_defaults(func=cmd_check_trace)
 
     args = parser.parse_args()
     if not args.command:

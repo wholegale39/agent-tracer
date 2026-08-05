@@ -10,6 +10,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 
 from .models import ReplayRequest, Span, SpanIn, Trace, TraceIn
+from .regression import CheckResult, compare, suggest_case_name, trace_signature
 from .store import TraceStore
 
 
@@ -156,6 +157,139 @@ def _replay_instructions(tool_name: str, args: dict) -> str:
         return f"Search/query: {query}"
 
     return json.dumps(args, indent=2)
+
+
+# ── Regression cases ─────────────────────────────────────────
+
+@app.post("/traces/{trace_id}/promote")
+async def promote_trace(trace_id: str, task: str = ""):
+    """Promote a completed trace into a golden regression case."""
+    trace = await store.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(404, "Trace not found")
+    if not trace.spans:
+        raise HTTPException(400, "Trace has no spans — nothing to promote")
+
+    import uuid
+    case_id = uuid.uuid4().hex[:12]
+    sig = trace_signature(trace)
+    name = suggest_case_name(trace.agent, task or trace.task, trace_id)
+    await store.create_case(
+        case_id, name, sig["agent"], task or trace.task,
+        trace_id, sig,
+    )
+    return {
+        "case_id": case_id,
+        "name": name,
+        "agent": sig["agent"],
+        "task": task or trace.task,
+        "source_trace_id": trace_id,
+        "spans": sig["span_count"],
+        "signature": sig,
+    }
+
+
+@app.get("/cases")
+async def list_cases(agent: str = "", limit: int = 50):
+    """List golden regression cases."""
+    return await store.list_cases(agent=agent, limit=limit)
+
+
+@app.get("/cases/{case_id}")
+async def get_case(case_id: str):
+    """Get a regression case with its signature."""
+    case = await store.get_case(case_id)
+    if not case:
+        raise HTTPException(404, "Case not found")
+    import json
+    case = dict(case)
+    case["signature"] = json.loads(case["signature"])
+    return case
+
+
+@app.post("/cases/{case_id}/check")
+async def check_case(case_id: str, trace_id: str = ""):
+    """Compare a golden case against a new trace.
+
+    Pass ?trace_id=xxx to check a specific trace, or omit to check the
+    agent's most recent trace automatically.
+    """
+    case = await store.get_case(case_id)
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    import json
+    sig = json.loads(case["signature"])
+
+    if trace_id:
+        trace = await store.get_trace(trace_id)
+        if not trace:
+            raise HTTPException(404, "Trace not found")
+    else:
+        # Auto: find most recent trace for the case's agent+task
+        candidates = await store.list_traces(limit=50, agent=sig.get("agent", ""))
+        if not candidates:
+            raise HTTPException(404, "No traces found for this agent")
+        target = candidates[0]
+        if sig.get("task") and target["task"] != sig["task"]:
+            # look for a task match first
+            for c in candidates:
+                if c["task"] == sig["task"]:
+                    target = c
+                    break
+        trace = await store.get_trace(target["id"])
+        if not trace:
+            raise HTTPException(404, "Trace not found")
+
+    result = compare(sig, trace)
+    await store.update_case_result(case_id, result.verdict, result.score)
+
+    return {
+        "case_id": case_id,
+        "name": case["name"],
+        "checked_trace_id": trace.id,
+        "checked_agent": trace.agent,
+        "checked_task": trace.task,
+        "verdict": result.verdict,
+        "score": result.score,
+        "summary": result.summary,
+        "diffs": [d.__dict__ for d in result.diffs],
+        "golden_span_count": len(sig.get("spans", [])),
+        "new_span_count": len(trace.spans),
+    }
+
+
+@app.post("/traces/{trace_id}/check")
+async def check_trace_against_golden(trace_id: str):
+    """Check a trace against the golden case for its agent (if one exists)."""
+    trace = await store.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(404, "Trace not found")
+
+    case = await store.find_case_for_agent(trace.agent, trace.task)
+    if not case:
+        return {
+            "found": False,
+            "message": f"No golden case for agent '{trace.agent}' yet — "
+                       f"promote one with POST /traces/{trace_id}/promote",
+        }
+
+    import json
+    sig = json.loads(case["signature"])
+    result = compare(sig, trace)
+    await store.update_case_result(case["id"], result.verdict, result.score)
+
+    return {
+        "found": True,
+        "case_id": case["id"],
+        "case_name": case["name"],
+        "verdict": result.verdict,
+        "score": result.score,
+        "summary": result.summary,
+        "diffs": [d.__dict__ for d in result.diffs],
+        "golden_span_count": len(sig.get("spans", [])),
+        "new_span_count": len(trace.spans),
+    }
 
 
 # ── Health ──────────────────────────────────────────────
