@@ -16,6 +16,7 @@ from .regression import (CheckResult, compare, export_pytest_case,
                          suggest_case_name, trace_signature,
                          trace_to_export_dict)
 from .store import TraceStore
+from .webhook_rx import router as hermes_webhook_router
 
 
 store: Optional[TraceStore] = None
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agent Call Tracer", version="0.4.0", lifespan=lifespan)
+app.include_router(hermes_webhook_router)
 
 
 # ── Traces ───────────────────────────────────────────────
