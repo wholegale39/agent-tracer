@@ -207,6 +207,44 @@ curl -s "http://localhost:8770/errors/aggregate"
 | `GET` | `/cost/traces/{id}` | 单次 trace 成本明细（per tool / per model）(v0.4) |
 | `GET` | `/cost/summary` | 成本汇总（per tool / model / agent，`?agent=&days=` 过滤）(v0.4) |
 | `GET` | `/errors/aggregate` | 跨会话错误归因（指纹聚桶）(v0.4) |
+| `POST` | `/hermes-events` | 接收 Hermes outbound webhook 事件（HMAC 签名验证）(v0.5) |
+| `GET` | `/hermes-events/stats` | webhook 事件统计（总量/已验证/按事件类型）(v0.5) |
+| `GET` | `/hermes-events/recent?limit=N` | 最近 N 条事件（默认 10，上限 100）(v0.5) |
+
+## Hermes 自动对接（v0.5 新增）
+
+Hermes Agent v0.20.0+ 原生支持 **outbound webhook**（`hooks.outbound` 配置），可以把会话/工具调用/子任务事件实时推送到 agent-tracer——**零代码侵入 Hermes，数据自动入库**。
+
+### Hermes 侧配置
+
+在 `~/.hermes/config.yaml` 加：
+
+```yaml
+hooks:
+  outbound:
+    - url: "http://127.0.0.1:8770/hermes-events"
+      events: [on_session_start, on_session_end, post_tool_call, subagent_stop]
+      secret_env: HERMES_OUTBOUND_WEBHOOK_SECRET
+      name: agent-tracer
+```
+
+`.env` 里设 `HERMES_OUTBOUND_WEBHOOK_SECRET=<随机串>`（agent-tracer 进程环境里有同名变量时自动做 HMAC-SHA256 校验，GitHub 风格 `X-Hermes-Signature-256`）。
+
+可用事件：`on_session_start` / `on_session_end` / `pre_tool_call` / `post_tool_call` / `subagent_start` / `subagent_stop` 等（`hermes hooks list` 查看已注册）。
+
+### 验证
+
+```bash
+# 发一条消息让 Hermes 干活，然后：
+curl -s http://localhost:8770/hermes-events/stats
+curl -s "http://localhost:8770/hermes-events/recent?limit=5"
+```
+
+### 对接价值
+
+- **全自动留痕**：Hermes 每次干活自动记录（无需手动灌数据），可统计工具使用频率、任务时长、失败分布
+- **漂移检测素材**：真实会话可作为 golden case 的候选（`promote`）
+- **行为分析**：会话起止 + 工具序列还原任务路径，配合 `/errors/aggregate` 找高频故障
 
 ## 数据模型
 
@@ -229,6 +267,14 @@ Case (黄金回归用例, v0.2)
  ├── source_trace_id: 被提升的 trace
  ├── signature: {tool_sequence, spans: [{tool, arg_keys, status}]}
  └── last_verdict: match | drift | regression
+
+WebhookEvent (Hermes 自动推送, v0.5)
+ ├── delivery_id: 事件唯一 ID（去重用）
+ ├── hook_event_name: on_session_start | on_session_end | post_tool_call | ...
+ ├── session_id / tool_name / cwd
+ ├── payload: 完整原始 JSON
+ ├── verified: HMAC 签名是否通过
+ └── received_at
 ```
 
 ## 架构

@@ -77,6 +77,24 @@ curl -s "$TRACER_BASE_URL/errors/aggregate?limit=500"
 
 错误指纹会归一化变量部分：数字 / 超时秒数（`30s`、`60s` → `N`）/ 十六进制地址 / 引号内容。`timeout after 30s` 和 `timeout after 60s` 归到同一桶，按出现次数排序——直接暴露反复出现的根因。
 
+## 工作流 5：Hermes 自动对接（outbound webhook 推送，无需手动灌数据）
+
+Hermes Agent v0.20.0+ 原生支持 outbound webhook，配置后会话 / 工具调用 / 子任务事件**自动**推送到 agent-tracer，agent 侧零代码侵入：
+
+```yaml
+# ~/.hermes/config.yaml
+hooks:
+  outbound:
+    - url: "http://127.0.0.1:8770/hermes-events"
+      events: [on_session_start, on_session_end, post_tool_call, subagent_stop]
+      secret_env: HERMES_OUTBOUND_WEBHOOK_SECRET
+      name: agent-tracer
+```
+
+- `.env` 设 `HERMES_OUTBOUND_WEBHOOK_SECRET` 后，接收端自动做 HMAC-SHA256 校验（GitHub 风格 `X-Hermes-Signature-256`），`verified` 标记入库
+- 事件存 `webhook_events` 表（`delivery_id` 去重），与 traces/spans 逻辑隔离，互不影响
+- 验证：`curl -s $TRACER_BASE_URL/hermes-events/stats` 看总量/已验证/按事件类型
+
 ## 完整 API 速查
 
 | Method | Path | 说明 |
@@ -93,6 +111,9 @@ curl -s "$TRACER_BASE_URL/errors/aggregate?limit=500"
 | GET | `/cost/traces/{id}` | 单 trace 成本 |
 | GET | `/cost/summary` | 成本汇总（agent/days 过滤） |
 | GET | `/errors/aggregate` | 错误指纹聚桶 |
+| POST | `/hermes-events` | 接收 Hermes outbound webhook 事件（HMAC 验证） |
+| GET | `/hermes-events/stats` | 事件统计（总量/已验证/按事件类型） |
+| GET | `/hermes-events/recent` | 最近事件（`?limit=N`，默认 10） |
 
 ## 注意事项（pitfalls）
 
@@ -101,6 +122,7 @@ curl -s "$TRACER_BASE_URL/errors/aggregate?limit=500"
 - **回归检测需要先 promote**：没有黄金用例时 `/check` 返回 `found: false`，提示先 promote
 - **漂移报告适合挂 cron**：每天定时跑 `drift-report`，行为漂移第一时间暴露
 - **本地模型 $0**：定价表内置 qwen2.5:7b / llama3.2:3b 等本地模型为 $0，NAS 跑本地 LLM 时成本归因仍准确
+- **webhook `verified=0` 排查**：接收端只在进程环境有 `HERMES_OUTBOUND_WEBHOOK_SECRET` 时才校验签名；服务重启后忘带环境变量 → 事件照常入库但 `verified=0`（不阻塞 ingest，仅标记）。部署脚本务必显式 export 该变量
 
 ## 相关链接
 
