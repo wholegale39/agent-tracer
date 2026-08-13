@@ -1,8 +1,16 @@
 # Agent Call Tracer · Agent 调用追踪器
 
-![License](https://img.shields.io/badge/license-MIT-green) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![GitHub stars](https://img.shields.io/github/stars/wholegale39/agent-tracer)
+![License](https://img.shields.io/badge/license-MIT-green) ![Python](https://img.shields.io/badge/python-3.10+-blue) ![CI](https://img.shields.io/github/actions/workflow/status/wholegale39/agent-tracer/ci.yml) ![GitHub stars](https://img.shields.io/github/stars/wholegale39/agent-tracer)
 
-记录 Agent 的每一次工具调用——入参、出参、耗时、错误。支持按会话回溯、跨工具过滤、错误汇总，还能对失败的调用生成重放指令。**升级版自带回归测试闭环：把一次成功运行提升为黄金用例，后续运行自动对比，漂移和回归一眼可见；v0.4 起支持按 token 归因成本、跨会话错误指纹聚桶。**
+> 记录 Agent 的每一次工具调用——入参、出参、耗时、错误。支持按会话回溯、跨工具过滤、错误汇总，还能对失败的调用生成重放指令。
+
+**升级版自带回归测试闭环：把一次成功运行提升为黄金用例，后续运行自动对比，漂移和回归一眼可见；v0.4 起支持按 token 归因成本、跨会话错误指纹聚桶。**
+
+## ✨ 亮点
+
+- 🎥 **DVR 回放** — 录下 Agent 每个动作，事后一帧帧回放，失败调用自动生成重放指令
+- 🔁 **回归闭环** — 成功运行提升为黄金用例，后续运行自动对比，漂移和回归一眼可见
+- 💰 **成本归因** — v0.4 起按 token 归因成本、跨会话错误指纹聚桶
 
 ## 为什么做这个？
 
