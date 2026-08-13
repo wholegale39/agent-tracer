@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
-from .models import ReplayRequest, Span, SpanIn, Trace, TraceIn
+from .models import EventIn, ReplayRequest, Span, SpanIn, Trace, TraceIn
 from . import cost
 from .regression import (CheckResult, compare, export_pytest_case,
                          suggest_case_name, trace_signature,
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     await store.close()
 
 
-app = FastAPI(title="Agent Call Tracer", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Agent Call Tracer", version="0.5.0", lifespan=lifespan)
 app.include_router(hermes_webhook_router)
 
 
@@ -71,6 +71,32 @@ async def get_trace(trace_id: str):
     if not trace:
         raise HTTPException(404, "Trace not found")
     return trace
+
+
+# ── Event stream (v0.5) ────────────────────────────────────
+
+@app.post("/traces/{trace_id}/events")
+async def append_event(trace_id: str, ev: EventIn):
+    """Append a raw event to the trace's append-only stream.
+
+    Event types (v0.5): trace.started / trace.finished / context.injected /
+    prompt.assembled / llm.request / llm.response / agent.step /
+    agent.message / tool.call / tool.result / tool.error
+    """
+    trace = await store.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(404, "Trace not found")
+    seq = await store.append_event(trace_id, ev.type, ev.payload)
+    return {"trace_id": trace_id, "seq": seq, "type": ev.type}
+
+
+@app.get("/traces/{trace_id}/events")
+async def list_events(trace_id: str, type: str = "", limit: int = 100):
+    """Read a trace's event stream, oldest first. Optional type filter."""
+    trace = await store.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(404, "Trace not found")
+    return await store.list_events(trace_id, type=type, limit=limit)
 
 
 # ── Spans ───────────────────────────────────────────────

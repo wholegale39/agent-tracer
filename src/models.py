@@ -71,3 +71,9 @@ class ReplayRequest(BaseModel):
     span_id: int
     arguments_override: dict[str, Any] = Field(default_factory=dict)
     trace_id: str = "replay"
+
+
+class EventIn(BaseModel):
+    """Append a raw event to a trace's append-only event stream (v0.5)."""
+    type: str
+    payload: dict[str, Any] = Field(default_factory=dict)

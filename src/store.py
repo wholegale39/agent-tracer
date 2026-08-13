@@ -71,6 +71,17 @@ class TraceStore:
                 last_score REAL
             );
             CREATE INDEX IF NOT EXISTS idx_cases_agent ON cases(agent);
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(trace_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_trace ON events(trace_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
         """)
         # v0.4 migration: add cost-tracking columns to existing DBs (no-op on fresh)
         for col in ("model", "input_tokens", "output_tokens"):
@@ -90,6 +101,10 @@ class TraceStore:
             "INSERT INTO traces (id, agent, task, session_id, started_at) VALUES (?, ?, ?, ?, ?)",
             (trace.id, trace.agent, trace.task, trace.session_id, now)
         )
+        # v0.5: append-only event stream (double-write projection)
+        await self.append_event(trace.id, "trace.started", {
+            "agent": trace.agent, "task": trace.task, "session_id": trace.session_id,
+        })
         await self._conn.commit()
         return trace.id
 
@@ -98,6 +113,7 @@ class TraceStore:
         await self._conn.execute(
             "UPDATE traces SET finished_at = ? WHERE id = ?", (now, trace_id)
         )
+        await self.append_event(trace_id, "trace.finished", {"finish_reason": "completed"})
         await self._conn.commit()
 
     async def get_trace(self, trace_id: str) -> Optional[Trace]:
@@ -151,6 +167,18 @@ class TraceStore:
         await self._conn.execute(
             "UPDATE traces SET span_count = span_count + 1 WHERE id = ?", (trace_id,)
         )
+        # v0.5: append-only event stream (double-write projection)
+        await self.append_event(trace_id, "tool.call", {
+            "tool_name": span.tool_name, "arguments": span.arguments,
+            "started_at": span.started_at or now, "finished_at": span.finished_at,
+            "duration_ms": span.duration_ms,
+            "model": span.model, "input_tokens": span.input_tokens,
+            "output_tokens": span.output_tokens,
+        })
+        if span.result is not None:
+            await self.append_event(trace_id, "tool.result", {"result": span.result})
+        if span.error:
+            await self.append_event(trace_id, "tool.error", {"error": span.error})
         await self._conn.commit()
 
         # Return the auto-generated id
@@ -158,6 +186,43 @@ class TraceStore:
             "SELECT MAX(id) as id FROM spans WHERE trace_id = ?", (trace_id,)
         )
         return row[0]["id"] if row else 0
+
+    # ── Event stream (v0.5, append-only) ──────────────────────
+
+    async def append_event(self, trace_id: str, type: str, payload: dict) -> int:
+        """Append one event to a trace's stream. Returns the event seq."""
+        import json
+        now = datetime.now(timezone.utc).isoformat()
+        row = await self._conn.execute_fetchall(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE trace_id = ?",
+            (trace_id,)
+        )
+        seq = row[0][0] if row else 1
+        await self._conn.execute(
+            "INSERT INTO events (trace_id, seq, ts, type, payload) VALUES (?, ?, ?, ?, ?)",
+            (trace_id, seq, now, type, json.dumps(payload, ensure_ascii=False))
+        )
+        return seq
+
+    async def list_events(self, trace_id: str, type: str = "", limit: int = 100) -> list[dict]:
+        """Read a trace's event stream (oldest first). Optional type filter."""
+        import json
+        if type:
+            rows = await self._conn.execute_fetchall(
+                "SELECT * FROM events WHERE trace_id = ? AND type = ? ORDER BY seq LIMIT ?",
+                (trace_id, type, limit)
+            )
+        else:
+            rows = await self._conn.execute_fetchall(
+                "SELECT * FROM events WHERE trace_id = ? ORDER BY seq LIMIT ?",
+                (trace_id, limit)
+            )
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["payload"] = json.loads(d["payload"])
+            result.append(d)
+        return result
 
     async def get_span(self, span_id: int) -> Optional[Span]:
         rows = await self._conn.execute_fetchall(
