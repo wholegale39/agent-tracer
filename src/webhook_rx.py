@@ -98,9 +98,126 @@ async def receive_event(
             datetime.now(timezone.utc).isoformat(),
         ),
     )
+    # v0.5: sync Hermes lifecycle events into the append-only event stream.
+    # Same transaction as the webhook_events insert (committed together below).
+    try:
+        await _sync_event_stream(payload, verified)
+    except Exception:
+        # Event-stream sync is best-effort; never let it break webhook ingest.
+        pass
     await store._conn.commit()
 
     return {"ok": True, "delivery_id": delivery_id, "event": event_name, "verified": bool(verified)}
+
+
+# ── v0.5: webhook → event-stream sync ──────────────────────────
+# Hermes hooks.outbound emits: on_session_start / post_tool_call / on_session_end.
+# These are mapped onto the append-only events stream so a trace captures
+# the full run: session start, every tool call (args + result), and completion.
+
+# session_id -> trace_id in-memory cache (webhook volume is high; avoids a
+# DB query per event). Invalidated lazily — a missing trace falls back to a
+# lookup, then to auto-create.
+_session_trace_cache: dict[str, str] = {}
+
+_RESULT_TRUNCATE = 4000  # keep the event stream lean; full result stays in webhook_events
+
+
+def _session_id_of(payload: dict) -> str:
+    return str(payload.get("session_id") or "")
+
+
+async def _get_or_create_trace(session_id: str) -> str | None:
+    """Return trace_id for a Hermes session, creating one on first sight."""
+    from .api import store
+    cached = _session_trace_cache.get(session_id)
+    if cached:
+        return cached
+    # Look for an open trace for this session
+    rows = await store._conn.execute_fetchall(
+        "SELECT id FROM traces WHERE session_id = ? AND finished_at IS NULL ORDER BY started_at DESC LIMIT 1",
+        (session_id,),
+    )
+    if rows:
+        trace_id = rows[0]["id"]
+    else:
+        import uuid as _uuid
+        from .models import Trace
+        trace = Trace(
+            id=_uuid.uuid4().hex[:12],
+            agent="hermes",
+            task=f"session:{session_id}",
+            session_id=session_id,
+        )
+        trace_id = await store.create_trace(trace)
+    _session_trace_cache[session_id] = trace_id
+    # Keep the cache bounded (sessions churn; 2k is plenty)
+    if len(_session_trace_cache) > 2000:
+        _session_trace_cache.clear()
+    return trace_id
+
+
+async def _sync_event_stream(payload: dict, verified: int) -> None:
+    """Map a Hermes webhook payload onto the event stream (best-effort)."""
+    from .api import store
+    event = payload.get("hook_event_name") or ""
+    session_id = _session_id_of(payload)
+
+    if not session_id:
+        return
+
+    if event == "on_session_start":
+        trace_id = await _get_or_create_trace(session_id)
+        # trace.started already appended by create_trace; only add when reusing
+        return
+
+    if event == "post_tool_call":
+        tool_name = payload.get("tool_name") or "unknown"
+        tool_input = payload.get("tool_input") or {}
+        extra = payload.get("extra") or {}
+        result = extra.get("result")
+        trace_id = await _get_or_create_trace(session_id)
+        if not trace_id:
+            return
+        # add_span writes BOTH the spans projection and the tool.call/result
+        # events, so regression/cost/drift keep working on webhook-fed traces.
+        from .models import Span
+        if result is not None and not isinstance(result, str):
+            result = json.dumps(result, ensure_ascii=False)
+        if isinstance(result, str) and len(result) > _RESULT_TRUNCATE:
+            result = result[:_RESULT_TRUNCATE]
+        await store.add_span(trace_id, Span(
+            tool_name=tool_name,
+            arguments=tool_input,
+            result=result,
+        ))
+        return
+
+    if event == "on_session_end":
+        trace_id = _session_trace_cache.get(session_id)
+        if not trace_id:
+            rows = await store._conn.execute_fetchall(
+                "SELECT id FROM traces WHERE session_id = ? ORDER BY started_at DESC LIMIT 1",
+                (session_id,),
+            )
+            trace_id = rows[0]["id"] if rows else None
+        if not trace_id:
+            return
+        extra = payload.get("extra") or {}
+        completed = bool(extra.get("completed", True))
+        await store.append_event(trace_id, "trace.finished", {
+            "finish_reason": "completed" if completed else "interrupted",
+            "turn_id": extra.get("turn_id", ""),
+            "source": "webhook",
+        })
+        # Close the trace without re-appending trace.finished (finish_trace
+        # appends its own event — avoid the duplicate).
+        now = datetime.now(timezone.utc).isoformat()
+        await store._conn.execute(
+            "UPDATE traces SET finished_at = ? WHERE id = ?", (now, trace_id)
+        )
+        _session_trace_cache.pop(session_id, None)
+        return
 
 
 @router.get("/stats")
